@@ -1,7 +1,7 @@
 {
-  "name": "decky-plugin-template",
-  "version": "0.0.1",
-  "description": "A template to quickly create decky plugins from scratch, based on TypeScript and webpack",
+  "name": "deckplayer",
+  "version": "1.0.0",
+  "description": "A beautiful MP3/audio player for Steam Deck with spinning CD animation and album art",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
