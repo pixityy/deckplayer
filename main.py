@@ -1,21 +1,26 @@
 import os
 import asyncio
 import base64
+import json
 import random
 
 import decky
 from typing import Optional, List, Dict, Any
 
+_MPV_SOCKET = "/tmp/deckplayer_mpv.sock"
+
 
 class Plugin:
-    _mpg123_proc: Optional[asyncio.subprocess.Process] = None
+    _mpv_proc: Optional[asyncio.subprocess.Process] = None
+    _reader: Optional[asyncio.StreamReader] = None
+    _writer: Optional[asyncio.StreamWriter] = None
     _reading_task: Optional[asyncio.Task] = None
+    _poll_task: Optional[asyncio.Task] = None
     _status: Dict[str, Any] = {}
     _playlist: List[str] = []
     _current_index: int = -1
-    _current_fps: float = 38.28   # updated from @S output
     _auto_advance: bool = True
-    _seeking: bool = False
+    _req_id: int = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -34,20 +39,31 @@ class Plugin:
         }
         self._playlist = []
         self._current_index = -1
-        await self._start_mpg123()
+        await self._start_mpv()
         decky.logger.info("DeckPlayer: started")
 
     async def _unload(self):
         decky.logger.info("DeckPlayer: unloading…")
         if self._reading_task:
             self._reading_task.cancel()
-        if self._mpg123_proc:
+        if self._poll_task:
+            self._poll_task.cancel()
+        if self._writer:
             try:
-                await self._send_command("QUIT")
-                await asyncio.sleep(0.15)
-                self._mpg123_proc.terminate()
+                await self._ipc(["quit"])
+                await asyncio.sleep(0.1)
             except Exception:
                 pass
+        if self._mpv_proc:
+            try:
+                self._mpv_proc.terminate()
+            except Exception:
+                pass
+        # clean up socket file
+        try:
+            os.remove(_MPV_SOCKET)
+        except OSError:
+            pass
         decky.logger.info("DeckPlayer: unloaded")
 
     async def _uninstall(self):
@@ -56,118 +72,161 @@ class Plugin:
     async def _migration(self):
         pass
 
-    # ── mpg123 process management ──────────────────────────────────────────
+    # ── mpv process ────────────────────────────────────────────────────────
 
-    async def _start_mpg123(self):
+    async def _start_mpv(self):
+        # Remove stale socket if present
         try:
-            self._mpg123_proc = await asyncio.create_subprocess_exec(
-                "mpg123", "-R", "--no-gapless",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
+            os.remove(_MPV_SOCKET)
+        except OSError:
+            pass
+
+        try:
+            self._mpv_proc = await asyncio.create_subprocess_exec(
+                "mpv",
+                f"--input-ipc-server={_MPV_SOCKET}",
+                "--no-video",
+                "--idle=yes",
+                "--quiet",
+                "--really-quiet",
+                "--audio-display=no",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            self._reading_task = self.loop.create_task(self._read_output())
-            await self._send_command(f"VOLUME {self._status['volume']}")
-            decky.logger.info("DeckPlayer: mpg123 process started")
         except FileNotFoundError:
-            decky.logger.error("DeckPlayer: mpg123 not found – please run: sudo pacman -S mpg123")
+            decky.logger.error("DeckPlayer: mpv not found – install with: sudo pacman -S mpv")
+            return
         except Exception as exc:
-            decky.logger.error(f"DeckPlayer: could not start mpg123: {exc}")
+            decky.logger.error(f"DeckPlayer: failed to start mpv: {exc}")
+            return
 
-    async def _send_command(self, cmd: str):
-        proc = self._mpg123_proc
-        if proc and proc.stdin and not proc.stdin.is_closing():
-            try:
-                proc.stdin.write(f"{cmd}\n".encode())
-                await proc.stdin.drain()
-            except Exception as exc:
-                decky.logger.error(f"DeckPlayer: send_command '{cmd}' failed: {exc}")
+        # Wait up to 3 s for the socket to appear
+        for _ in range(30):
+            if os.path.exists(_MPV_SOCKET):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            decky.logger.error("DeckPlayer: mpv IPC socket never appeared")
+            return
 
-    # ── Output reader ──────────────────────────────────────────────────────
+        try:
+            self._reader, self._writer = await asyncio.open_unix_connection(_MPV_SOCKET)
+        except Exception as exc:
+            decky.logger.error(f"DeckPlayer: could not connect to mpv socket: {exc}")
+            return
 
-    async def _read_output(self):
-        decky.logger.info("DeckPlayer: output reader started")
-        _last_pos_emit = 0.0
+        self._reading_task = self.loop.create_task(self._read_events())
+
+        # Observe properties we care about
+        await self._ipc(["observe_property", 1, "time-pos"])
+        await self._ipc(["observe_property", 2, "pause"])
+        await self._ipc(["observe_property", 3, "duration"])
+
+        # Apply initial volume
+        await self._ipc(["set_property", "volume", self._status["volume"]])
+
+        decky.logger.info("DeckPlayer: mpv IPC connected")
+
+    # ── IPC helpers ────────────────────────────────────────────────────────
+
+    async def _ipc(self, command: list) -> Optional[Any]:
+        """Send a command and return the response data (fire-and-forget if writer is gone)."""
+        if not self._writer or self._writer.is_closing():
+            return None
+        self._req_id += 1
+        msg = json.dumps({"command": command, "request_id": self._req_id}) + "\n"
+        try:
+            self._writer.write(msg.encode())
+            await self._writer.drain()
+        except Exception as exc:
+            decky.logger.error(f"DeckPlayer: IPC write error: {exc}")
+        return None
+
+    async def _get_property(self, name: str) -> Optional[Any]:
+        """Request a property value synchronously (best-effort)."""
+        if not self._writer or self._writer.is_closing():
+            return None
+        self._req_id += 1
+        rid = self._req_id
+        msg = json.dumps({"command": ["get_property", name], "request_id": rid}) + "\n"
+        try:
+            self._writer.write(msg.encode())
+            await self._writer.drain()
+        except Exception:
+            return None
+        # We don't wait for the response; property-change events keep state updated.
+        return None
+
+    # ── Event reader ───────────────────────────────────────────────────────
+
+    async def _read_events(self):
+        decky.logger.info("DeckPlayer: event reader started")
+        _last_emit = 0.0
+
         while True:
             try:
-                if not self._mpg123_proc or self._mpg123_proc.stdout.at_eof():
-                    break
-                raw = await asyncio.wait_for(
-                    self._mpg123_proc.stdout.readline(), timeout=1.0
-                )
+                raw = await asyncio.wait_for(self._reader.readline(), timeout=1.0)
                 if not raw:
                     break
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
+                try:
+                    data = json.loads(raw.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
                     continue
 
-                # --- @P  state update ---
-                if line.startswith("@P "):
-                    try:
-                        state = int(line[3:].strip())
-                        was_playing = self._status.get("playing", False)
-                        if state == 0:
-                            self._status["playing"] = False
-                            self._status["paused"] = False
-                            self._status["current_position"] = 0.0
-                            if was_playing and self._auto_advance:
-                                self.loop.create_task(self._on_track_end())
-                        elif state == 1:
-                            self._status["playing"] = True
-                            self._status["paused"] = True
-                        elif state == 2:
-                            self._status["playing"] = True
-                            self._status["paused"] = False
+                event = data.get("event")
+
+                # --- property-change ---
+                if event == "property-change":
+                    name = data.get("name")
+                    val = data.get("data")
+
+                    if name == "time-pos" and val is not None:
+                        pos = float(val)
+                        self._status["current_position"] = pos
+                        if pos - _last_emit >= 0.25:
+                            _last_emit = pos
+                            await decky.emit(
+                                "player_position",
+                                pos,
+                                self._status["duration"],
+                            )
+
+                    elif name == "duration" and val is not None:
+                        self._status["duration"] = float(val)
+
+                    elif name == "pause" and val is not None:
+                        self._status["paused"] = bool(val)
                         await decky.emit("player_status", self._status)
-                    except ValueError:
-                        pass
 
-                # --- @F  frame / position ---
-                elif line.startswith("@F "):
-                    try:
-                        parts = line[3:].strip().split()
-                        if len(parts) >= 4:
-                            cur_sec = float(parts[2])
-                            rem_sec = float(parts[3])
-                            total = cur_sec + rem_sec
-                            self._status["current_position"] = cur_sec
-                            if total > 0:
-                                self._status["duration"] = total
-                            # throttle to ~4 Hz to avoid flooding UI
-                            if cur_sec - _last_pos_emit >= 0.25:
-                                _last_pos_emit = cur_sec
-                                await decky.emit(
-                                    "player_position",
-                                    cur_sec,
-                                    self._status["duration"],
-                                )
-                    except (ValueError, IndexError):
-                        pass
+                # --- playback started ---
+                elif event == "start-file":
+                    self._status["playing"] = True
+                    self._status["paused"] = False
+                    self._status["current_position"] = 0.0
+                    await decky.emit("player_status", self._status)
 
-                # --- @S  stream info (get fps) ---
-                elif line.startswith("@S "):
-                    try:
-                        parts = line[3:].strip().split()
-                        if len(parts) > 2:
-                            sample_rate = int(parts[2])
-                            layer = int(float(parts[1]))
-                            spf = 576 if layer == 2 else 1152
-                            self._current_fps = sample_rate / spf
-                    except (ValueError, IndexError):
-                        pass
-
-                # --- @E  error ---
-                elif line.startswith("@E "):
-                    decky.logger.error(f"DeckPlayer: mpg123 error: {line[3:]}")
+                # --- track ended ---
+                elif event == "end-file":
+                    reason = data.get("reason", "")
+                    if reason in ("eof", "stop"):
+                        was_playing = self._status.get("playing", False)
+                        self._status["playing"] = False
+                        self._status["paused"] = False
+                        self._status["current_position"] = 0.0
+                        await decky.emit("player_status", self._status)
+                        if reason == "eof" and was_playing and self._auto_advance:
+                            self.loop.create_task(self._on_track_end())
 
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                decky.logger.error(f"DeckPlayer: reader error: {exc}")
+                decky.logger.error(f"DeckPlayer: event reader error: {exc}")
                 break
-        decky.logger.info("DeckPlayer: output reader stopped")
+
+        decky.logger.info("DeckPlayer: event reader stopped")
 
     # ── Playlist helpers ───────────────────────────────────────────────────
 
@@ -177,7 +236,6 @@ class Plugin:
             await self._play_at(self._current_index)
         elif repeat == "all" or self._current_index < len(self._playlist) - 1:
             await self._advance(+1)
-        # else: end of playlist, do nothing
 
     async def _play_at(self, index: int) -> bool:
         if not (0 <= index < len(self._playlist)):
@@ -186,8 +244,7 @@ class Plugin:
         self._current_index = index
         self._status["current_index"] = index
         self._status["current_file"] = path
-        self._status["current_position"] = 0.0
-        await self._send_command(f"LOAD {path}")
+        await self._ipc(["loadfile", path])
         await decky.emit("player_status", self._status)
         return True
 
@@ -216,7 +273,7 @@ class Plugin:
             except PermissionError:
                 pass
 
-        audio_exts = {".mp3", ".ogg", ".flac", ".wav", ".m4a", ".aac", ".opus"}
+        audio_exts = {".mp3", ".ogg", ".flac", ".wav", ".m4a", ".aac", ".opus", ".wma"}
         found: List[str] = []
         for base in search_dirs:
             if not os.path.isdir(base):
@@ -261,7 +318,7 @@ class Plugin:
                 if "album" in t:
                     meta["album"] = str(t["album"][0])
 
-            # Album art – MP3
+            # Album art – MP3 / ID3
             try:
                 from mutagen.id3 import ID3  # type: ignore
                 id3 = ID3(path)
@@ -287,7 +344,7 @@ class Plugin:
                 except Exception:
                     pass
 
-            # Album art – M4A/AAC
+            # Album art – M4A / AAC
             if meta["cover"] is None:
                 try:
                     if path.lower().endswith((".m4a", ".aac", ".mp4")):
@@ -338,16 +395,17 @@ class Plugin:
 
     async def play(self, path: str) -> bool:
         self._status["current_file"] = path
-        await self._send_command(f"LOAD {path}")
+        await self._ipc(["loadfile", path])
         return True
 
     async def pause_resume(self) -> bool:
-        await self._send_command("PAUSE")
+        paused = self._status.get("paused", False)
+        await self._ipc(["set_property", "pause", not paused])
         return True
 
     async def stop(self) -> bool:
         self._auto_advance = False
-        await self._send_command("STOP")
+        await self._ipc(["stop"])
         self._auto_advance = True
         return True
 
@@ -360,8 +418,7 @@ class Plugin:
     async def prev_track(self) -> int:
         self._auto_advance = False
         if self._status.get("current_position", 0) > 3.0:
-            # restart current track if more than 3 s in
-            await self._send_command("JUMP 0")
+            await self._ipc(["seek", 0, "absolute"])
         else:
             await self._advance(-1)
         self._auto_advance = True
@@ -373,12 +430,12 @@ class Plugin:
     async def set_volume(self, volume: int) -> int:
         vol = max(0, min(100, int(volume)))
         self._status["volume"] = vol
-        await self._send_command(f"VOLUME {vol}")
+        await self._ipc(["set_property", "volume", vol])
         return vol
 
     async def seek(self, seconds: float) -> bool:
-        frame = int(float(seconds) * self._current_fps)
-        await self._send_command(f"JUMP {frame}")
+        await self._ipc(["seek", float(seconds), "absolute"])
+        self._status["current_position"] = float(seconds)
         return True
 
     async def set_playlist(self, paths: List[str]) -> bool:
